@@ -3,36 +3,192 @@
 
 import { useState } from "react";
 
+type Message = {
+  role: "user" | "assistant";
+  text: string;
+};
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "");
+
+const WELCOME_MESSAGE: Message = {
+  role: "assistant",
+  text: "Welcome to DocuMind AI. Upload a PDF and ask questions to explore its content.",
+};
+
 export default function Home() {
   const [question, setQuestion] = useState("");
   const [fileName, setFileName] = useState("");
-  const [messages, setMessages] = useState<
-    { role: string; text: string }[]
-  >([
-    {
-      role: "assistant",
-      text: "Welcome to DocuMind AI. Upload a document and ask questions to explore its content.",
-    },
-  ]);
+  const [documentReady, setDocumentReady] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([WELCOME_MESSAGE]);
 
-  function handleUpload(file?: File) {
-    if (file) setFileName(file.name);
-  }
+  async function handleUpload(file?: File) {
+    if (!file) return;
 
-  function sendMessage() {
-    if (!question.trim()) return;
+    if (!API_URL) {
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: "Backend URL is not configured. Add NEXT_PUBLIC_API_URL to your Vercel project environment variables.",
+        },
+      ]);
+      return;
+    }
+
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: "Please select a PDF file. This version supports PDF documents.",
+        },
+      ]);
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: "This PDF is larger than 10 MB. Please choose a smaller file.",
+        },
+      ]);
+      return;
+    }
+
+    setFileName(file.name);
+    setDocumentReady(false);
+    setUploading(true);
 
     setMessages((previous) => [
       ...previous,
-      { role: "user", text: question.trim() },
       {
         role: "assistant",
-        text: fileName
-          ? `Your question has been received about "${fileName}". Connect the AI backend to generate answers from the document.`
-          : "Please upload a document first. Then connect the AI backend to ask questions about its content.",
+        text: `Uploading and processing ${file.name}. Please wait...`,
       },
     ]);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const response = await fetch(`${API_URL}/upload`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.detail || "PDF upload failed.");
+      }
+
+      setDocumentReady(true);
+
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: `Successfully processed ${result.filename}.\nPages: ${result.pages}\nCharacters extracted: ${result.characters}\n\nYou can now ask questions about this document.`,
+        },
+      ]);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "An unexpected error occurred.";
+
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: `Upload failed: ${errorMessage}\n\nCheck that the Render backend is running and its API key and billing are configured correctly.`,
+        },
+      ]);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function sendMessage() {
+    const questionText = question.trim();
+
+    if (!questionText || asking) return;
+
+    if (!documentReady) {
+      setMessages((previous) => [
+        ...previous,
+        { role: "user", text: questionText },
+        {
+          role: "assistant",
+          text: "Please upload a PDF and wait for successful processing before asking questions.",
+        },
+      ]);
+      setQuestion("");
+      return;
+    }
+
+    if (!API_URL) {
+      setMessages((previous) => [
+        ...previous,
+        { role: "user", text: questionText },
+        {
+          role: "assistant",
+          text: "Backend URL is not configured in Vercel.",
+        },
+      ]);
+      setQuestion("");
+      return;
+    }
+
+    setMessages((previous) => [
+      ...previous,
+      { role: "user", text: questionText },
+    ]);
     setQuestion("");
+    setAsking(true);
+
+    try {
+      const response = await fetch(`${API_URL}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ question: questionText }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.detail || "Could not answer your question.");
+      }
+
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", text: result.answer },
+      ]);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "An unexpected error occurred.";
+
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          text: `Could not generate an answer: ${errorMessage}`,
+        },
+      ]);
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  function newConversation() {
+    setQuestion("");
+    setFileName("");
+    setDocumentReady(false);
+    setMessages([WELCOME_MESSAGE]);
   }
 
   return (
@@ -49,16 +205,8 @@ export default function Home() {
         </div>
 
         <button
-          onClick={() => {
-            setMessages([
-              {
-                role: "assistant",
-                text: "Welcome to DocuMind AI. Upload a document and ask questions to explore its content.",
-              },
-            ]);
-            setQuestion("");
-            setFileName("");
-          }}
+          type="button"
+          onClick={newConversation}
           className="rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white hover:bg-indigo-700"
         >
           + New conversation
@@ -92,8 +240,13 @@ export default function Home() {
               Ask questions. Discover insights.
             </p>
           </div>
+
           <span className="rounded-full bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700">
-            ● Workspace ready
+            {uploading
+              ? "Processing document..."
+              : documentReady
+                ? "● Document ready"
+                : "Workspace ready"}
           </span>
         </header>
 
@@ -109,8 +262,8 @@ export default function Home() {
               </span>
             </h2>
             <p className="mt-4 max-w-2xl leading-7 text-slate-500">
-              Upload a PDF or text document and prepare to explore its key
-              ideas, summarize important sections, and find answers faster.
+              Upload a PDF to summarize important sections, explore key ideas,
+              and get AI-generated answers based on its content.
             </p>
           </div>
 
@@ -118,33 +271,53 @@ export default function Home() {
             <span className="mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-100 text-2xl">
               ⇧
             </span>
+
             <span className="font-semibold">Upload your document</span>
+
             <span className="mt-2 text-sm text-slate-500">
-              Choose a PDF, TXT, or other document from your computer
+              Choose a PDF file up to 10 MB
             </span>
+
             <span className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white">
-              Browse files
+              {uploading ? "Processing..." : "Browse files"}
             </span>
+
             <input
               type="file"
-              accept=".pdf,.txt,.md,.csv"
+              accept=".pdf,application/pdf"
               className="hidden"
-              onChange={(event) => handleUpload(event.target.files?.[0])}
+              disabled={uploading}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void handleUpload(file);
+                event.currentTarget.value = "";
+              }}
             />
           </label>
 
           {fileName && (
             <div className="mb-5 flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
               <span className="text-xl">▤</span>
+
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-semibold">{fileName}</p>
                 <p className="text-xs text-emerald-700">
-                  Selected locally — AI processing is not connected yet
+                  {uploading
+                    ? "Uploading and indexing PDF..."
+                    : documentReady
+                      ? "PDF uploaded and indexed successfully"
+                      : "Upload did not complete"}
                 </p>
               </div>
+
               <button
-                onClick={() => setFileName("")}
-                className="text-sm text-slate-500 hover:text-red-600"
+                type="button"
+                disabled={uploading}
+                onClick={() => {
+                  setFileName("");
+                  setDocumentReady(false);
+                }}
+                className="text-sm text-slate-500 hover:text-red-600 disabled:opacity-50"
               >
                 Remove
               </button>
@@ -169,6 +342,7 @@ export default function Home() {
                     D
                   </div>
                 )}
+
                 <div
                   className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-6 ${
                     message.role === "user"
@@ -180,31 +354,40 @@ export default function Home() {
                 </div>
               </div>
             ))}
+
+            {asking && (
+              <p className="text-sm text-slate-500">
+                DocuMind AI is preparing your answer...
+              </p>
+            )}
           </div>
 
           <form
             className="mt-4 flex gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm"
             onSubmit={(event) => {
               event.preventDefault();
-              sendMessage();
+              void sendMessage();
             }}
           >
             <input
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
               placeholder="Ask a question about your document..."
+              disabled={asking || uploading}
               className="min-w-0 flex-1 bg-transparent px-3 py-3 text-sm outline-none"
             />
+
             <button
               type="submit"
-              className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-700"
+              disabled={asking || uploading || !question.trim()}
+              className="rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Send ↗
+              {asking ? "Thinking..." : "Send ↗"}
             </button>
           </form>
 
           <p className="mt-3 text-center text-xs text-slate-400">
-            Preview interface · AI answers require a connected backend
+            Powered by your DocuMind AI backend
           </p>
         </div>
       </section>
