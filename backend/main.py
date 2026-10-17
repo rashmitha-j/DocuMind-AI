@@ -10,22 +10,24 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 
 from llama_index.core import VectorStoreIndex, Document, Settings
-from llama_index.llms.openai import OpenAI
-from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 
 
-# Load the API key from the project root .env file
+# Load local .env when running on your own computer.
+# Render uses its Environment Variables settings.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 app = FastAPI(
     title="DocuMind AI API",
     description="Upload PDFs and ask questions about their content",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://docu-mind-ai-delta.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
@@ -33,7 +35,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Store the currently uploaded document's index in memory.
+# The active document is stored in memory.
+# It will be lost when the backend restarts.
 document_index = None
 document_filename = None
 
@@ -47,6 +50,7 @@ def home():
     return {
         "message": "DocuMind AI backend is running!",
         "status": "success",
+        "provider": "Google Gemini",
     }
 
 
@@ -80,7 +84,8 @@ async def upload_document(file: UploadFile = File(...)):
         text = "\n".join(
             page.extract_text() or "" for page in reader.pages
         ).strip()
-    except Exception:
+    except Exception as exc:
+        print("PDF reading error:", repr(exc))
         raise HTTPException(
             status_code=400,
             detail="Could not read this PDF. Please try another file.",
@@ -92,16 +97,22 @@ async def upload_document(file: UploadFile = File(...)):
             detail="No extractable text found. Scanned PDFs need OCR.",
         )
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not os.getenv("GOOGLE_API_KEY"):
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY is missing from the backend environment.",
+            detail="GOOGLE_API_KEY is missing from the backend environment.",
         )
 
     try:
-        Settings.llm = OpenAI(model="gpt-4o-mini")
-        Settings.embed_model = OpenAIEmbedding(
-            model="text-embedding-3-small"
+        # Use Gemini for both document embeddings and chat.
+        Settings.llm = GoogleGenAI(
+            model="gemini-2.5-flash",
+            api_key=os.environ["GOOGLE_API_KEY"],
+        )
+
+        Settings.embed_model = GoogleGenAIEmbedding(
+            model_name="gemini-embedding-001",
+            api_key=os.environ["GOOGLE_API_KEY"],
         )
 
         document = Document(
@@ -109,20 +120,21 @@ async def upload_document(file: UploadFile = File(...)):
             metadata={"filename": filename},
         )
 
-        # Create a searchable index from the extracted PDF text.
+        # Extract text and create a searchable index.
         new_index = VectorStoreIndex.from_documents([document])
 
-        # Replace the active index only after indexing succeeds.
+        # Keep the old index if the new indexing attempt fails.
         document_index = new_index
         document_filename = filename
 
     except Exception as exc:
-        print("PDF indexing error:", repr(exc))
+        print("Gemini PDF indexing error:", repr(exc))
         raise HTTPException(
             status_code=502,
             detail=(
-                "PDF text was extracted, but AI indexing failed. "
-                "Check API billing, model access, and the backend terminal."
+                "PDF text was extracted, but Gemini indexing failed. "
+                "Check Render logs, API key validity, model availability, "
+                "and Google AI Studio usage limits."
             ),
         )
 
@@ -130,8 +142,11 @@ async def upload_document(file: UploadFile = File(...)):
         "filename": filename,
         "pages": len(reader.pages),
         "characters": len(text),
-        "text_preview": text[:3000],
-        "message": "PDF uploaded and indexed successfully. You can ask questions now.",
+        "text_preview": text[:1000],
+        "message": (
+            "PDF uploaded and indexed successfully. "
+            "You can ask questions now."
+        ),
     }
 
 
@@ -153,6 +168,7 @@ def chat(request: ChatRequest):
         query_engine = document_index.as_query_engine(
             similarity_top_k=3
         )
+
         response = query_engine.query(request.question)
 
         return {
@@ -162,11 +178,12 @@ def chat(request: ChatRequest):
         }
 
     except Exception as exc:
-        print("Question-answering error:", repr(exc))
+        print("Gemini question-answering error:", repr(exc))
         raise HTTPException(
             status_code=502,
             detail=(
-                "Could not generate an answer. Check API billing, "
-                "model access, and the backend terminal."
+                "Could not generate an answer using Gemini. "
+                "Check Render logs, API key validity, model availability, "
+                "and Google AI Studio usage limits."
             ),
         )
