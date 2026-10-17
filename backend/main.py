@@ -106,7 +106,7 @@ async def upload_document(file: UploadFile = File(...)):
     try:
         # Use Gemini for both document embeddings and chat.
         Settings.llm = GoogleGenAI(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             api_key=os.environ["GOOGLE_API_KEY"],
         )
 
