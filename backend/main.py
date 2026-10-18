@@ -9,9 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 
-from llama_index.core import VectorStoreIndex, Document, Settings
-from llama_index.llms.google_genai import GoogleGenAI
-from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+from genai_service import create_document_index, answer_question
 
 
 # Load local .env when running on your own computer.
@@ -103,21 +101,23 @@ async def upload_document(file: UploadFile = File(...)):
             detail="GOOGLE_API_KEY is missing from the backend environment.",
         )
 
+    
     try:
-        # Use Gemini for both document embeddings and chat.
-        Settings.llm = GoogleGenAI(
-            model="gemini-3.8-flash",
-            api_key=os.environ["GOOGLE_API_KEY"],
-        )
+        new_index = create_document_index(text, filename)
 
-        Settings.embed_model = GoogleGenAIEmbedding(
-            model_name="gemini-embedding-001",
-            api_key=os.environ["GOOGLE_API_KEY"],
-        )
+        # Keep the old index if the new indexing attempt fails.
+        document_index = new_index
+        document_filename = filename
 
-        document = Document(
-            text=text,
-            metadata={"filename": filename},
+    except Exception as exc:
+        print("Gemini PDF indexing error:", repr(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "PDF text was extracted, but Gemini indexing failed. "
+                "Check Render logs, API key validity, model availability, "
+                "and Google AI Studio usage limits."
+            ),
         )
 
         # Extract text and create a searchable index.
@@ -164,16 +164,13 @@ def chat(request: ChatRequest):
             detail="Upload a PDF before asking questions.",
         )
 
+    
     try:
-        query_engine = document_index.as_query_engine(
-            similarity_top_k=3
-        )
-
-        response = query_engine.query(request.question)
+        answer = answer_question(document_index, request.question)
 
         return {
             "question": request.question,
-            "answer": str(response),
+            "answer": answer,
             "filename": document_filename,
         }
 
