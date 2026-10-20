@@ -1,7 +1,28 @@
+# Environment files (keep only the placeholder example)
 .env
 .env.*
+!.env.example
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend
 frontend/node_modules/
 frontend/.next/
+frontend/out/
+
+# Local artifacts
+*.log
+backend/data/
+*.db
+*.sqlite3
+uploads/
+storage/
+*.zip
+.DS_Store
