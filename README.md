@@ -1,5 +1,7 @@
 # DocuMind AI
 
+[![CI](https://github.com/rashmitha-j/DocuMind-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/rashmitha-j/DocuMind-AI/actions/workflows/ci.yml)
+
 **Author:** Rashmitha J
 
 DocuMind AI is a private PDF question-answering app. You sign in, upload PDFs to your own document library, choose which documents to search, and ask questions. Answers come from Google Gemini, grounded in passages retrieved from your documents. Each answer lists its sources: the document name, page number and the exact supporting passage.
@@ -8,10 +10,25 @@ DocuMind AI is a private PDF question-answering app. You sign in, upload PDFs to
 |---|---|---|
 | GitHub | https://github.com/rashmitha-j/DocuMind-AI | Repository reachable |
 | Frontend (Vercel) | https://docu-mind-ai-delta.vercel.app/ | Page loads (HTTP 200) |
-| Backend (Render) | https://documind-ai-backend-nzk0.onrender.com/ | `/health` returned 200 after a ~50 s cold start |
+| Backend (Render) | https://documind-ai-backend-nzk0.onrender.com/ | `/health` reports PostgreSQL and durable storage |
+| Health | https://documind-ai-backend-nzk0.onrender.com/health | Returns 200, no Gemini call |
 | Google AI Studio | https://aistudio.google.com/ | Not tested (account-specific) |
 
 See [Project status](#project-status) for what has and has not been verified.
+
+## Screenshots
+
+These were captured from the real app running locally (headless Microsoft Edge), with synthetic sample PDFs indexed by the real Gemini embedding API.
+
+| Sign in | Document library |
+|---|---|
+| ![Sign-in screen](docs/screenshots/01-sign-in.png) | ![Library with two indexed PDFs and usage](docs/screenshots/03-document-library.png) |
+
+An empty library, right after registration:
+
+![Empty library](docs/screenshots/02-empty-library.png)
+
+There is no answer-with-citations screenshot yet. While capturing on 2026-10-20, Gemini's embedding service did not respond within the app's deadline, and a mock answer is not used here.
 
 ## Contents
 
@@ -28,6 +45,7 @@ See [Project status](#project-status) for what has and has not been verified.
 - [Run locally](#run-locally)
 - [Environment variables](#environment-variables)
 - [Testing](#testing)
+- [Continuous integration](#continuous-integration)
 - [API reference](#api-reference)
 - [Deployment](#deployment)
 - [Free-tier notes](#free-tier-notes)
@@ -114,7 +132,7 @@ For `POST /chat` the backend:
 1. checks the session and that **every** selected document belongs to the caller (otherwise `404`),
 2. loads chunks filtered by both the document IDs and the caller's user ID,
 3. embeds the question and ranks chunks by cosine similarity,
-4. sends Gemini the top chunks as numbered sources, each labelled with filename and page. This is one `generate_content` request with a 30 s timeout, low thinking and a 2048-token output cap. If the main model is overloaded or times out, the fallback model gets one try with a 60 s timeout,
+4. sends Gemini the top chunks as numbered sources, each labelled with filename and page. This is one `generate_content` request with a 30 s deadline, low thinking and a 2048-token output cap. If the main model is overloaded or misses its deadline, the fallback model gets one try with a 60 s deadline. Deadlines are wall-clock limits enforced by the backend. The SDK's own timeout only limits the gap between received bytes, so a slowly trickling response could otherwise run for minutes. The question embedding has a 45 s deadline and upload embeddings 120 s, so a question takes at most about 135 s, within the frontend's 180 s wait,
 5. returns the answer plus the sources it was given:
 
 ```json
@@ -156,20 +174,32 @@ The `sources` list holds the chunks that were actually retrieved and given to th
 | Files per upload | 5 | `MAX_FILES_PER_UPLOAD` |
 | Request body limit (`Content-Length`) | files × size + 1 MB | derived |
 | Max pages | 300 | `MAX_PDF_PAGES` |
-| Documents per user | 50 | `MAX_DOCUMENTS_PER_USER` |
+| Documents per user | 10 | `MAX_DOCUMENTS_PER_USER` |
+| Total PDF storage per user | 50 MB | `MAX_STORAGE_MB_PER_USER` |
 | Password-protected PDFs | rejected | — |
 | Filenames | used for display only; storage uses generated IDs | — |
+
+Quota checks return `403` and happen twice. A cheap check runs before the PDF is parsed or embedded, so over-quota files cost nothing. The authoritative check runs inside the insert transaction, under a per-user lock and a `SELECT ... FOR UPDATE` on the user row, so parallel uploads cannot exceed the limit. A test sends 6 uploads in parallel with a limit of 2, and exactly 2 succeed. Re-uploading a file you already have is not counted. Deleting a document frees its quota immediately. A document whose indexing failed keeps its stored PDF so **Retry** works, counts towards the quota, and can be deleted. The library shows current usage.
 
 Rate limits return `429` with a `Retry-After` header:
 
 | Action | Default (requests/seconds) | Key | Setting |
 |---|---|---|---|
 | Register / sign in | 10/60 | client IP, plus email for sign-in | `RATE_LIMIT_AUTH` |
+| Register (all clients) | 30/3600 | global | `RATE_LIMIT_REGISTER_GLOBAL` |
 | Upload | 10/3600 | user | `RATE_LIMIT_UPLOAD` |
 | Retry processing | 10/3600 | user | `RATE_LIMIT_REINDEX` |
 | Questions | 20/600 | user | `RATE_LIMIT_CHAT` |
 
 The limiter keeps counters in process memory. That is correct for a single backend instance, which is what Render's free tier runs. With several instances or workers, each would count separately, and a shared store such as Redis would be needed.
+
+**Client IP behind Render.** Proxies append to `X-Forwarded-For`, so the entries on the left are whatever the client sent. The chain on this Render service was measured on 2026-10-20 with a temporary diagnostic endpoint, since removed:
+
+```
+<anything the client sends>, <real client IP>, <Cloudflare IP>, <Render load balancer 10.x>
+```
+
+The backend therefore takes the 3rd entry from the right (`TRUSTED_PROXY_HOPS=3`) and checks that it is a valid IP address. The old code trusted the first entry, which anyone could forge. Uvicorn's own `request.client` on Render also reflects the forged first entry, so it is used only when the header has fewer entries than expected (local development). If the hosting setup changes, re-measure and set `TRUSTED_PROXY_HOPS`. Sign-in is also limited per email, and sign-ups have a global cap, neither of which depends on IP addresses.
 
 ## Database and storage
 
@@ -186,17 +216,19 @@ Tables are created automatically on startup (`Base.metadata.create_all`). There 
 Deleting a document removes its metadata, PDF bytes and chunks in one database transaction, so no orphaned vectors remain.
 
 - **Local:** with no `DATABASE_URL`, SQLite is used at `backend/data/documind.db` (git-ignored).
-- **Production:** set `DATABASE_URL` to a free hosted PostgreSQL database, for example Neon or Supabase. PDFs are stored in the database, so no separate object storage service is needed. A 10 MB PDF takes 10 MB of database space, plus about 3 KB per chunk for vectors. Check your provider's free storage limit.
+- **Production:** set `DATABASE_URL` to a free hosted PostgreSQL database. The live backend uses Neon. The original PDF bytes are stored **in PostgreSQL** (`document_files` table), so they are as durable as the database. There is no separate file store. Storage per document is roughly: the PDF size, plus about 3 KB of vector and 1–4 KB of text per chunk, plus a few hundred bytes of metadata. With the defaults (10 documents, 50 MB per user), one account can use at most about 50 MB of PDFs plus their chunks. Check your Neon project's storage limit and lower `MAX_STORAGE_MB_PER_USER` or `ALLOW_REGISTRATION` if needed. Uploads are processed in memory; nothing is written to the Render disk.
 - **Without `DATABASE_URL` on Render**, the backend falls back to SQLite on the container's temporary disk. Accounts and documents are then **lost** on every restart, redeploy or free-tier spin-down. `/health` reports `"durable_storage": false` in that case.
 
 ## Repository structure
 
 ```
 DocuMind-AI/
+├── .github/workflows/ci.yml  # backend tests + frontend lint/typecheck/build
+├── docs/screenshots/         # real screenshots used in this README
 ├── backend/
 │   ├── main.py            # FastAPI app, routes, upload pipeline, validation
 │   ├── database.py        # SQLAlchemy models and engine setup
-│   ├── security.py        # password hashing, sessions, rate limiter
+│   ├── security.py        # password hashing, sessions, client IP, rate limiter
 │   ├── genai_service.py   # chunking, Gemini embeddings/answers, retrieval, error mapping
 │   └── tests/             # offline pytest suite (no Gemini calls)
 ├── frontend/
@@ -270,7 +302,10 @@ Backend (`.env` locally, Render Environment in production). See [`.env.example`]
 | `DATABASE_URL` | production | PostgreSQL URL; empty means local SQLite |
 | `GEMINI_MODEL` | no | Answer model, default `gemini-3.8-flash` |
 | `GEMINI_FALLBACK_MODEL` | no | Used only when the main model is overloaded or times out, default `gemini-3.7-flash`; empty disables |
-| `GEMINI_TIMEOUT_SECONDS` / `GEMINI_FALLBACK_TIMEOUT_SECONDS` | no | Answer timeouts, default 30 / 60 |
+| `GEMINI_TIMEOUT_SECONDS` / `GEMINI_FALLBACK_TIMEOUT_SECONDS` | no | Answer deadlines, default 30 / 60 |
+| `GEMINI_EMBED_TIMEOUT_SECONDS` / `GEMINI_QUERY_EMBED_TIMEOUT_SECONDS` | no | Embedding deadlines, default 120 / 45 |
+| `MAX_DOCUMENTS_PER_USER` / `MAX_STORAGE_MB_PER_USER` | no | Per-account quotas, default 10 / 50 |
+| `TRUSTED_PROXY_HOPS` | no | Trusted `X-Forwarded-For` entries from the right, default 3 (measured on Render) |
 | `GEMINI_THINKING_LEVEL` / `GEMINI_MAX_OUTPUT_TOKENS` | no | Default `LOW` / `2048`; empty thinking level disables it |
 | `GEMINI_EMBED_MODEL` / `GEMINI_EMBED_DIMENSIONS` | no | Embedding model, default `gemini-embedding-001` / `768` |
 | `ALLOWED_ORIGINS` | no | Extra CORS origins (comma-separated) |
@@ -292,7 +327,7 @@ All backend tests run offline. A deterministic keyword-count embedding and Llama
 python -m pytest backend/tests
 ```
 
-The suite covers PDF extraction, page-preserving chunking, upload validation (wrong type, fake PDF, corrupt, empty, too large, too many pages, scanned), multi-file upload, duplicate reuse without re-embedding, persistence across a simulated restart, recovery of interrupted processing, deletion cleanup, citation document/page accuracy, retrieval limited to selected documents, registration/login/logout/expiry, cross-user isolation on every document route, rate limits, CORS, and Gemini quota/key/timeout handling.
+The suite (80 tests) covers PDF extraction, per-user document and storage quotas (including parallel uploads), client-IP extraction with missing, malformed and forged `X-Forwarded-For` headers, wall-clock deadlines for slow Gemini calls, the overload fallback, page-preserving chunking, upload validation (wrong type, fake PDF, corrupt, empty, too large, too many pages, scanned), multi-file upload, duplicate reuse without re-embedding, persistence across a simulated restart, recovery of interrupted processing, deletion cleanup, citation document/page accuracy, retrieval limited to selected documents, registration/login/logout/expiry, cross-user isolation on every document route, rate limits, CORS, and Gemini quota/key/timeout handling.
 
 Frontend checks:
 
@@ -359,6 +394,13 @@ curl -X POST http://127.0.0.1:8000/chat -H "Authorization: Bearer $TOKEN" -H "Co
 
 If the frontend URL changes, add it to `ALLOWED_ORIGINS` on Render.
 
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on pull requests:
+
+- **backend:** Python 3.12, `pip install -r requirements-dev.txt`, `pytest backend/tests`. Tests use fake embeddings, a fake answer function and temporary SQLite databases, so no Gemini key, secrets or database credentials are needed.
+- **frontend:** Node 22, `npm ci`, ESLint, `next typegen` + `tsc --noEmit`, and `next build`.
+
 ## Free-tier notes
 
 - **Render free:** the service sleeps after inactivity, and the first request can take about a minute (the frontend waits up to 180 s). The disk is temporary, so use an external database.
@@ -407,8 +449,11 @@ No paid service is required, but none of these free tiers is guaranteed to be un
 
 Verified on 2026-10-20:
 
-- **Backend:** 55 offline pytest tests pass (no Gemini calls).
-- **Frontend:** ESLint, TypeScript and `next build` pass.
-- **Local end-to-end:** real frontend and backend, with fake AI models and SQLite. Covered: register, upload two PDFs, ask a question scoped to one document (correct document and page cited), restart the backend (session and library persisted), delete, sign out, and a 375 px mobile layout.
-- **Live Gemini:** a real upload on the live site indexed successfully, which confirms embeddings. On 2026-10-20 `gemini-3.8-flash` returned `503 UNAVAILABLE` (high demand). A local live run of the answer path then fell back to `gemini-3.7-flash` and returned a correctly cited answer.
-- **Production:** Render uses Neon PostgreSQL (`/health` reports `"database": "postgresql"`, `"durable_storage": true`).
+- **Backend:** 80 offline pytest tests pass locally (no Gemini calls).
+- **CI:** GitHub Actions runs the same backend tests plus frontend lint, type check and build (see the badge at the top).
+- **Live site:** a real account registered on the live site uploaded a PDF and received a Gemini answer with sources, which confirms embeddings, retrieval, citations and the Neon database in production.
+- **Production health:** `/health` reports `"database": "postgresql"` and `"durable_storage": true`.
+- **Proxy chain:** the `X-Forwarded-For` layout was measured on the live Render service, and the client-IP logic and tests follow it.
+- **Local end-to-end with real Gemini:** sign-in, upload and indexing of two synthetic PDFs succeeded (screenshots above). Indexing took about 3 minutes because Gemini was under heavy load. The follow-up question then hit the embedding deadline and returned a clear "timed out, try again" message instead of hanging.
+- **Gemini reliability:** on 2026-10-20 `gemini-3.8-flash` repeatedly returned `503 UNAVAILABLE` (high demand), and embeddings were slow. The fallback model and deadlines handle this, but answers can fail or take a while during such periods.
+- **Not verified live:** cross-user isolation on the production deployment. It is covered by offline tests only, because creating extra accounts on production was avoided.

@@ -113,3 +113,51 @@ def test_embedding_configuration(monkeypatch):
     genai_service.configure_gemini()
     assert captured["embedding_config"] == {"output_dimensionality": 768}
     assert captured["timeout"] == 60
+
+
+def test_with_deadline_stops_waiting_for_slow_calls():
+    import time
+
+    start = time.monotonic()
+    try:
+        genai_service.with_deadline(0.2, time.sleep, 2)
+        raise AssertionError("expected AITimeoutError")
+    except genai_service.AITimeoutError as exc:
+        assert "timed out" in str(exc)
+    assert time.monotonic() - start < 1.5
+    assert genai_service.classify_ai_error(genai_service.AITimeoutError("timed out"))[0] == 504
+
+
+def test_complete_enforces_wall_clock_deadline(monkeypatch):
+    import time
+
+    class SlowModels:
+        def generate_content(self, **kwargs):
+            time.sleep(2)  # e.g. a response that trickles bytes slowly
+            return SimpleNamespace(text="late")
+
+    monkeypatch.setattr(genai_service, "_client", SimpleNamespace(models=SlowModels()))
+    start = time.monotonic()
+    try:
+        REAL_COMPLETE("gemini-test", "prompt", 0.2)
+        raise AssertionError("expected AITimeoutError")
+    except genai_service.AITimeoutError:
+        pass
+    assert time.monotonic() - start < 1.5
+    assert genai_service.should_fall_back(genai_service.AITimeoutError("timed out"))
+
+
+def test_embeddings_have_deadline(monkeypatch):
+    import time
+
+    class SlowEmbed:
+        def get_text_embedding_batch(self, texts):
+            time.sleep(2)
+
+    monkeypatch.setattr(genai_service, "Settings", SimpleNamespace(embed_model=SlowEmbed()))
+    monkeypatch.setattr(genai_service, "EMBED_TIMEOUT_SECONDS", 0.2)
+    try:
+        genai_service.embed_texts(["x"])
+        raise AssertionError("expected AITimeoutError")
+    except genai_service.AITimeoutError:
+        pass

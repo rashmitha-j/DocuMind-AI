@@ -1,5 +1,7 @@
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import numpy as np
 from llama_index.core import Document, Settings
@@ -17,6 +19,8 @@ ANSWER_MAX_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
 # The main model gets less time so an overloaded call still leaves room for the fallback.
 LLM_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
 FALLBACK_TIMEOUT_SECONDS = int(os.getenv("GEMINI_FALLBACK_TIMEOUT_SECONDS", "60"))
+EMBED_TIMEOUT_SECONDS = int(os.getenv("GEMINI_EMBED_TIMEOUT_SECONDS", "120"))
+QUERY_EMBED_TIMEOUT_SECONDS = int(os.getenv("GEMINI_QUERY_EMBED_TIMEOUT_SECONDS", "45"))
 # Empty disables the setting for models that do not support thinking levels.
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "LOW").strip().upper()
 # Used only when the main model is overloaded (5xx). Empty disables it.
@@ -42,9 +46,19 @@ logger = logging.getLogger("documind")
 _configured = False
 _client = None
 
+# Gemini calls run here so a hard wall-clock deadline can be enforced. The SDK
+# timeout only limits the gap between received bytes, and a slow response that
+# trickles data can otherwise run for minutes. A call that misses its deadline
+# keeps its worker until Google responds, so the pool size bounds that cost.
+_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini")
+
 
 class AIConfigurationError(RuntimeError):
     """Raised when the Gemini API key is missing."""
+
+
+class AITimeoutError(TimeoutError):
+    """Raised when a Gemini call misses its wall-clock deadline."""
 
 
 class EmptyAnswerError(RuntimeError):
@@ -103,11 +117,26 @@ def genai_client():
     return _client
 
 
+def with_deadline(seconds: float, function, *args):
+    """Run a blocking Gemini call, giving up after `seconds` of wall-clock time."""
+
+    future = _executor.submit(function, *args)
+    try:
+        return future.result(timeout=seconds)
+    except FutureTimeoutError:
+        future.cancel()
+        raise AITimeoutError(f"Gemini did not respond within {seconds:g} seconds (timed out).") from None
+
+
 def complete(model: str, prompt: str, timeout_seconds: int = LLM_TIMEOUT_SECONDS) -> str:
     """One generate_content request: no retries, no chat session, no metadata calls."""
 
-    response = genai_client().models.generate_content(
-        model=model, contents=prompt, config=generation_config(timeout_seconds)
+    client = genai_client()
+    response = with_deadline(
+        timeout_seconds,
+        lambda: client.models.generate_content(
+            model=model, contents=prompt, config=generation_config(timeout_seconds)
+        ),
     )
     text = (response.text or "").strip()
 
@@ -182,13 +211,13 @@ def to_vector(values) -> np.ndarray:
 
 def embed_texts(texts: list[str]) -> list[bytes]:
     configure_gemini()
-    embeddings = Settings.embed_model.get_text_embedding_batch(texts)
+    embeddings = with_deadline(EMBED_TIMEOUT_SECONDS, Settings.embed_model.get_text_embedding_batch, texts)
     return [to_vector(values).tobytes() for values in embeddings]
 
 
 def embed_query(question: str) -> np.ndarray:
     configure_gemini()
-    return to_vector(Settings.embed_model.get_query_embedding(question))
+    return to_vector(with_deadline(QUERY_EMBED_TIMEOUT_SECONDS, Settings.embed_model.get_query_embedding, question))
 
 
 def rank_chunks(query_vector: np.ndarray, chunks: list, top_k: int = TOP_K) -> list[tuple]:
