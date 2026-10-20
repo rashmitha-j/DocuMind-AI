@@ -104,7 +104,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="DocuMind AI API",
     description="Upload PDFs and ask questions about their content",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
