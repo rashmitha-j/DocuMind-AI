@@ -126,17 +126,32 @@ def test_client_ip(monkeypatch, hops, forwarded, expected):
     assert security.client_ip(make_request(forwarded)) == expected
 
 
+def test_render_chain_measured_in_production(monkeypatch):
+    """Chains observed on Render with and without a forged header."""
+
+    monkeypatch.setattr(security, "TRUSTED_PROXY_HOPS", 3)
+    plain = "106.77.69.185, 172.69.123.214, 10.25.239.2"
+    forged = "1.2.3.4, 5.6.7.8,106.77.69.185, 172.69.123.214, 10.25.239.2"
+    # Uvicorn on Render reports the forged first entry as the peer.
+    assert security.client_ip(make_request(plain, peer="106.77.69.185")) == "106.77.69.185"
+    assert security.client_ip(make_request(forged, peer="1.2.3.4")) == "106.77.69.185"
+
+
+def test_default_trusts_three_hops():
+    assert security.TRUSTED_PROXY_HOPS == 3
+
+
 def test_forged_forwarded_for_cannot_bypass_auth_limit(client, monkeypatch):
     monkeypatch.setattr(main, "AUTH_LIMIT", (3, 60))
     limiter.reset()
 
-    # The trusted proxy always appends the real address last; the client
-    # rotates a forged first entry and a new email on every attempt.
+    # Render appends the real client, Cloudflare and its load balancer; the
+    # attacker rotates forged entries and a new email on every attempt.
     codes = [
         client.post(
             "/auth/login",
             json={"email": f"user{i}@example.com", "password": "wrong-password"},
-            headers={"X-Forwarded-For": f"10.9.9.{i}, 203.0.113.7"},
+            headers={"X-Forwarded-For": f"10.9.9.{i}, 8.8.{i}.1, 203.0.113.7, 172.69.1.1, 10.25.0.1"},
         ).status_code
         for i in range(4)
     ]

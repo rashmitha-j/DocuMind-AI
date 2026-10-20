@@ -434,17 +434,6 @@ def health_check():
     }
 
 
-@app.get("/debug/forwarded")
-def debug_forwarded(request: Request):
-    # TEMPORARY: shows the proxy chain so TRUSTED_PROXY_HOPS can be set from
-    # evidence. Returns only addresses already present in the caller's own request.
-    return {
-        "x_forwarded_for": request.headers.get("x-forwarded-for"),
-        "peer": request.client.host if request.client else None,
-        "client_ip": client_ip(request),
-    }
-
-
 @app.post("/auth/register", status_code=201)
 def register(credentials: Credentials, request: Request, db: Session = Depends(get_db)):
     limiter.check(f"auth:ip:{client_ip(request)}", *AUTH_LIMIT)

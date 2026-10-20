@@ -16,8 +16,10 @@ from sqlalchemy.orm import Session
 from database import AuthSession, User, get_db, utcnow
 
 SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
-# Number of proxies in front of the app that append to X-Forwarded-For.
-TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
+# Number of trusted entries at the right of X-Forwarded-For. Measured on
+# Render (2026-10-20): "<client-supplied...>, <real client>, <Cloudflare>,
+# <Render load balancer>", so the real client is the 3rd entry from the right.
+TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "3"))
 
 _hasher = PasswordHasher()
 _bearer = HTTPBearer(auto_error=False)
