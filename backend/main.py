@@ -556,5 +556,6 @@ def chat(request: ChatRequest, user: User = Depends(get_current_user), db: Sessi
         "question": question,
         "answer": result["answer"],
         "sources": result["sources"],
+        "model": result["model"],
         "document_ids": document_ids,
     }

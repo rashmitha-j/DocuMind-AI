@@ -1,8 +1,13 @@
+from types import SimpleNamespace
+
 from google.genai import errors
 
 import genai_service
 import main
 from conftest import make_pdf
+
+# Captured at import, before the autouse fixture swaps in an offline fake.
+REAL_COMPLETE = genai_service.complete
 
 
 def test_extract_pages_keeps_page_order():
@@ -48,3 +53,63 @@ def test_classify_errors():
     assert genai_service.classify_ai_error(TimeoutError("timed out"))[0] == 504
     assert genai_service.classify_ai_error(ConnectionError("network down"))[0] == 503
     assert genai_service.classify_ai_error(ValueError("other"))[0] == 502
+
+
+def test_gemini_answer_settings_are_bounded():
+    """Gemini 3 models must not get a temperature, and answers are capped."""
+
+    config = genai_service.generation_config()
+    assert config.temperature is None
+    assert config.max_output_tokens == genai_service.ANSWER_MAX_TOKENS
+    assert config.thinking_config.thinking_level.value == "LOW"
+    assert config.http_options.timeout == genai_service.LLM_TIMEOUT_SECONDS * 1000
+    assert genai_service.generation_config(60).http_options.timeout == 60_000
+
+
+def test_gemini_client_has_timeout(monkeypatch):
+    import google.genai as genai_module
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(genai_module, "Client", FakeClient)
+    monkeypatch.setattr(genai_service, "_client", None)
+
+    genai_service.genai_client()
+    assert captured["http_options"].timeout == max(genai_service.LLM_TIMEOUT_SECONDS, genai_service.FALLBACK_TIMEOUT_SECONDS) * 1000
+    assert captured["api_key"] == "test-key-not-real"
+
+
+def test_complete_rejects_empty_answer(monkeypatch):
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            assert "temperature" not in str(kwargs["config"].model_dump(exclude_none=True))
+            return SimpleNamespace(text=None)
+
+    monkeypatch.setattr(genai_service, "_client", SimpleNamespace(models=FakeModels()))
+    try:
+        REAL_COMPLETE("gemini-test", "prompt")
+        raise AssertionError("expected EmptyAnswerError")
+    except genai_service.EmptyAnswerError:
+        pass
+
+
+def test_embedding_configuration(monkeypatch):
+    import llama_index.embeddings.google_genai as embeddings_module
+
+    captured = {}
+
+    class FakeEmbedding:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(embeddings_module, "GoogleGenAIEmbedding", FakeEmbedding)
+    monkeypatch.setattr(genai_service, "_configured", False)
+    monkeypatch.setattr(genai_service, "Settings", SimpleNamespace())
+
+    genai_service.configure_gemini()
+    assert captured["embedding_config"] == {"output_dimensionality": 768}
+    assert captured["timeout"] == 60

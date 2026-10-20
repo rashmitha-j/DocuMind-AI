@@ -10,7 +10,6 @@ sys.path.insert(0, str(BACKEND_DIR))
 from fastapi.testclient import TestClient  # noqa: E402
 from llama_index.core import Settings  # noqa: E402
 from llama_index.core.embeddings import BaseEmbedding  # noqa: E402
-from llama_index.core.llms import MockLLM  # noqa: E402
 
 import database  # noqa: E402
 import genai_service  # noqa: E402
@@ -46,6 +45,12 @@ class KeywordEmbedding(BaseEmbedding):
 
     async def _aget_query_embedding(self, query: str) -> list[float]:
         return self._vector(query)
+
+
+def fake_complete(model: str, prompt: str, timeout_seconds: int | None = None) -> str:
+    """Offline stand-in for a Gemini answer."""
+
+    return f"Mock answer from {model}."
 
 
 def make_pdf(pages: list[str]) -> bytes:
@@ -98,7 +103,7 @@ def offline_app(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
     monkeypatch.setattr(genai_service, "_configured", True)
     Settings.embed_model = KeywordEmbedding()
-    Settings.llm = MockLLM(max_tokens=20)
+    monkeypatch.setattr(genai_service, "complete", fake_complete)
     limiter.reset()
     yield
     if database.engine is not None:

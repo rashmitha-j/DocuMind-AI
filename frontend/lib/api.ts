@@ -1,7 +1,7 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "");
 
-// Render's free tier can take about a minute to wake up, so allow time for a cold start.
-const REQUEST_TIMEOUT_MS = 120_000;
+// Allow for a Render cold start (~1 min) plus a Gemini answer that may need the fallback model.
+const REQUEST_TIMEOUT_MS = 180_000;
 
 export type User = { id: number; email: string };
 

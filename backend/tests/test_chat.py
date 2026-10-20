@@ -1,6 +1,5 @@
 from google.genai import errors
-from llama_index.core import Settings
-
+import genai_service
 import main
 from conftest import make_pdf, register, upload
 
@@ -50,13 +49,12 @@ def test_multi_document_question(client):
 def test_prompt_contains_only_retrieved_sources(client, monkeypatch):
     headers, ids = setup_documents(client)
     prompts = []
-    original = Settings.llm.complete
 
-    def capture(prompt, **kwargs):
+    def capture(model, prompt):
         prompts.append(prompt)
-        return original(prompt, **kwargs)
+        return "captured"
 
-    monkeypatch.setattr(type(Settings.llm), "complete", lambda self, prompt, **kw: capture(prompt, **kw))
+    monkeypatch.setattr(genai_service, "complete", capture)
     ask(client, headers, [ids["contract.pdf"]], "warranty years")
 
     [prompt] = prompts
@@ -129,3 +127,80 @@ def test_chat_rate_limit(client, monkeypatch):
     monkeypatch.setattr(main, "CHAT_LIMIT", (2, 600))
     codes = [ask(client, headers, [ids["solar.pdf"]], "solar?").status_code for _ in range(3)]
     assert codes == [200, 200, 429]
+
+
+def overloaded_error():
+    return errors.ServerError(
+        503,
+        {"error": {"code": 503, "message": "This model is currently experiencing high demand.", "status": "UNAVAILABLE"}},
+    )
+
+
+def test_overloaded_model_falls_back(client, monkeypatch):
+    headers, ids = setup_documents(client)
+    calls = []
+
+    def flaky(model, prompt, timeout_seconds=None):
+        calls.append(model)
+        if model == genai_service.chat_model():
+            raise overloaded_error()
+        return "fallback answer"
+
+    monkeypatch.setattr(genai_service, "complete", flaky)
+    body = ask(client, headers, [ids["contract.pdf"]], "warranty years").json()
+
+    assert calls == [genai_service.chat_model(), genai_service.FALLBACK_MODEL]
+    assert body["answer"] == "fallback answer"
+    assert body["model"] == genai_service.FALLBACK_MODEL
+    assert body["sources"][0]["filename"] == "contract.pdf"
+
+
+def test_timeout_falls_back_with_longer_timeout(client, monkeypatch):
+    headers, ids = setup_documents(client)
+    calls = []
+
+    def slow_then_ok(model, prompt, timeout_seconds=genai_service.LLM_TIMEOUT_SECONDS):
+        calls.append((model, timeout_seconds))
+        if model == genai_service.chat_model():
+            raise TimeoutError("The read operation timed out")
+        return "fallback answer"
+
+    monkeypatch.setattr(genai_service, "complete", slow_then_ok)
+    body = ask(client, headers, [ids["contract.pdf"]], "warranty years").json()
+
+    assert body["model"] == genai_service.FALLBACK_MODEL
+    assert calls[1] == (genai_service.FALLBACK_MODEL, genai_service.FALLBACK_TIMEOUT_SECONDS)
+
+
+def test_overload_without_fallback_reports_503(client, monkeypatch):
+    headers, ids = setup_documents(client)
+
+    def always_overloaded(model, prompt, timeout_seconds=None):
+        raise overloaded_error()
+
+    monkeypatch.setattr(genai_service, "complete", always_overloaded)
+    monkeypatch.setattr(genai_service, "FALLBACK_MODEL", "")
+
+    response = ask(client, headers, [ids["contract.pdf"]], "warranty years")
+    assert response.status_code == 503
+    assert "overloaded" in response.json()["detail"]
+
+
+def test_quota_error_does_not_use_fallback(client, monkeypatch):
+    headers, ids = setup_documents(client)
+    calls = []
+
+    def quota(model, prompt, timeout_seconds=None):
+        calls.append(model)
+        raise errors.ClientError(429, {"error": {"code": 429, "message": "Quota", "status": "RESOURCE_EXHAUSTED"}})
+
+    monkeypatch.setattr(genai_service, "complete", quota)
+    assert ask(client, headers, [ids["contract.pdf"]], "warranty years").status_code == 429
+    assert calls == [genai_service.chat_model()]
+
+
+def test_answer_reports_model(client):
+    headers, ids = setup_documents(client)
+    body = ask(client, headers, [ids["solar.pdf"]], "solar?").json()
+    assert body["model"] == genai_service.chat_model()
+    assert body["answer"] == f"Mock answer from {genai_service.chat_model()}."

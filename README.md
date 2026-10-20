@@ -54,7 +54,8 @@ Long PDFs such as reports, contracts and course notes are slow to search by hand
 - **Source citations:** each answer includes labelled sources (`[S1]`, `[S2]`, ...) with filename, 1-based page number, supporting excerpt and chunk ID.
 - **Grounded prompting:** Gemini is told to answer only from the retrieved sources and to say when they do not contain enough information.
 - **Validation and limits:** checks extension, MIME type, `%PDF-` signature, size, page count, encryption and extractable text. Rate limits cover sign-in, uploads, re-indexing and questions.
-- **Clear errors:** Gemini quota, invalid-key, missing-model, timeout and network failures each return a specific message without leaking secrets.
+- **Clear errors:** Gemini quota, invalid-key, missing-model, overload, timeout and network failures each return a specific message without leaking secrets.
+- **Overload fallback:** if the main Gemini model is overloaded (5xx) or times out, the question is retried once on a fallback model. Quota and key errors never fall back. The response's `model` field shows which model answered.
 
 ## Technology stack
 
@@ -65,7 +66,7 @@ Long PDFs such as reports, contracts and course notes are slow to search by hand
 | PDF parsing | `pypdf` |
 | Chunking | LlamaIndex `SentenceSplitter` (`llama-index-core`) |
 | Embeddings | Gemini `gemini-embedding-001` (768 dimensions) via `llama-index-embeddings-google-genai` |
-| Answer model | Gemini `gemini-3.8-flash` via `llama-index-llms-google-genai` |
+| Answer model | Gemini `gemini-3.8-flash` via the `google-genai` SDK, falling back to `gemini-3.7-flash` when overloaded |
 | Vector search | Cosine similarity with NumPy over the selected documents' stored vectors |
 | Database | SQLAlchemy 2: SQLite locally, PostgreSQL (psycopg 3) in production |
 | Passwords | Argon2id (`argon2-cffi`) |
@@ -113,12 +114,13 @@ For `POST /chat` the backend:
 1. checks the session and that **every** selected document belongs to the caller (otherwise `404`),
 2. loads chunks filtered by both the document IDs and the caller's user ID,
 3. embeds the question and ranks chunks by cosine similarity,
-4. sends Gemini the top chunks as numbered sources, each labelled with filename and page,
+4. sends Gemini the top chunks as numbered sources, each labelled with filename and page. This is one `generate_content` request with a 30 s timeout, low thinking and a 2048-token output cap. If the main model is overloaded or times out, the fallback model gets one try with a 60 s timeout,
 5. returns the answer plus the sources it was given:
 
 ```json
 {
   "answer": "The warranty lasts five years [S1].",
+  "model": "gemini-3.8-flash",
   "sources": [
     {
       "label": "S1",
@@ -267,6 +269,9 @@ Backend (`.env` locally, Render Environment in production). See [`.env.example`]
 | `GOOGLE_API_KEY` | yes | Gemini API key (server-side only) |
 | `DATABASE_URL` | production | PostgreSQL URL; empty means local SQLite |
 | `GEMINI_MODEL` | no | Answer model, default `gemini-3.8-flash` |
+| `GEMINI_FALLBACK_MODEL` | no | Used only when the main model is overloaded or times out, default `gemini-3.7-flash`; empty disables |
+| `GEMINI_TIMEOUT_SECONDS` / `GEMINI_FALLBACK_TIMEOUT_SECONDS` | no | Answer timeouts, default 30 / 60 |
+| `GEMINI_THINKING_LEVEL` / `GEMINI_MAX_OUTPUT_TOKENS` | no | Default `LOW` / `2048`; empty thinking level disables it |
 | `GEMINI_EMBED_MODEL` / `GEMINI_EMBED_DIMENSIONS` | no | Embedding model, default `gemini-embedding-001` / `768` |
 | `ALLOWED_ORIGINS` | no | Extra CORS origins (comma-separated) |
 | `ALLOW_REGISTRATION` | no | `false` disables sign-up |
@@ -356,7 +361,7 @@ If the frontend URL changes, add it to `ALLOWED_ORIGINS` on Render.
 
 ## Free-tier notes
 
-- **Render free:** the service sleeps after inactivity, and the first request can take about a minute (the frontend waits up to 120 s). The disk is temporary, so use an external database.
+- **Render free:** the service sleeps after inactivity, and the first request can take about a minute (the frontend waits up to 180 s). The disk is temporary, so use an external database.
 - **Gemini free tier:** request and token quotas apply, and models and limits can change. Quota errors are shown as a clear `429` message. The app never switches to a paid model.
 - **Free PostgreSQL** (e.g. Neon, Supabase): storage and compute limits apply. Render's own free PostgreSQL expires after a limited period.
 - **Vercel Hobby:** for personal, non-commercial use.
@@ -372,6 +377,8 @@ No paid service is required, but none of these free tiers is guaranteed to be un
 | Upload shows "Indexing failed ... quota" | Gemini free-tier limit reached; wait, then press **Retry** |
 | "API key is invalid" | Update `GOOGLE_API_KEY` on Render |
 | "configured Gemini model is unavailable" | Set `GEMINI_MODEL` / `GEMINI_EMBED_MODEL` to a model your key can use |
+| "Gemini is temporarily overloaded" | Both the main and fallback models returned server errors; wait a minute and ask again |
+| "The backend took too long to respond" | Cold start plus a slow Gemini answer took over 180 s; ask again |
 | "No extractable text found" | Scanned PDF; run OCR first (not built in) |
 | "indexed with a different embedding model" | Embedding settings changed; press **Retry** on that document |
 | CORS error in the browser console | Add the frontend origin to `ALLOWED_ORIGINS` |
@@ -400,8 +407,8 @@ No paid service is required, but none of these free tiers is guaranteed to be un
 
 Verified on 2026-10-20:
 
-- **Backend:** 46 offline pytest tests pass (no Gemini calls).
+- **Backend:** 55 offline pytest tests pass (no Gemini calls).
 - **Frontend:** ESLint, TypeScript and `next build` pass.
 - **Local end-to-end:** real frontend and backend, with fake AI models and SQLite. Covered: register, upload two PDFs, ask a question scoped to one document (correct document and page cited), restart the backend (session and library persisted), delete, sign out, and a 375 px mobile layout.
-- **Live Gemini:** no live Gemini call was made while building this version, so real-model answer quality was not re-tested.
-- **Production:** whether the new version is deployed, and whether `DATABASE_URL` is configured on Render, must be checked at `/health` after deployment.
+- **Live Gemini:** a real upload on the live site indexed successfully, which confirms embeddings. On 2026-10-20 `gemini-3.8-flash` returned `503 UNAVAILABLE` (high demand). A local live run of the answer path then fell back to `gemini-3.7-flash` and returned a correctly cited answer.
+- **Production:** Render uses Neon PostgreSQL (`/health` reports `"database": "postgresql"`, `"durable_storage": true`).
