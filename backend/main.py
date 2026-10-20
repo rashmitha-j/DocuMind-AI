@@ -2,7 +2,9 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -18,6 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 from pypdf import PdfReader  # noqa: E402
+from sqlalchemy import func  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 import database  # noqa: E402
@@ -48,11 +52,15 @@ logger = logging.getLogger("documind")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "10")) * 1024 * 1024
 MAX_FILES_PER_UPLOAD = int(os.getenv("MAX_FILES_PER_UPLOAD", "5"))
 MAX_PAGES = int(os.getenv("MAX_PDF_PAGES", "300"))
-MAX_DOCUMENTS_PER_USER = int(os.getenv("MAX_DOCUMENTS_PER_USER", "50"))
+MAX_DOCUMENTS_PER_USER = int(os.getenv("MAX_DOCUMENTS_PER_USER", "10"))
+# Total original-PDF bytes per account, so one user cannot fill the free database.
+MAX_STORAGE_PER_USER = int(os.getenv("MAX_STORAGE_MB_PER_USER", "50")) * 1024 * 1024
 MAX_CHAT_DOCUMENTS = 10
 ALLOW_REGISTRATION = os.getenv("ALLOW_REGISTRATION", "true").lower() == "true"
 
 AUTH_LIMIT = parse_limit("RATE_LIMIT_AUTH", "10/60")
+# Caps sign-ups across all clients, so forged client addresses cannot mass-register.
+REGISTER_GLOBAL_LIMIT = parse_limit("RATE_LIMIT_REGISTER_GLOBAL", "30/3600")
 UPLOAD_LIMIT = parse_limit("RATE_LIMIT_UPLOAD", "10/3600")
 CHAT_LIMIT = parse_limit("RATE_LIMIT_CHAT", "20/600")
 REINDEX_LIMIT = parse_limit("RATE_LIMIT_REINDEX", "10/3600")
@@ -248,6 +256,51 @@ def index_document(db: Session, document: Document, pages: list[str]):
     db.commit()
 
 
+# Serialises quota checks per user within this process; the row lock below does
+# the same across processes on PostgreSQL.
+_user_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
+
+
+def storage_usage(db: Session, user_id: int) -> tuple[int, int]:
+    """Return (document count, total PDF bytes) for a user."""
+
+    count, total = (
+        db.query(func.count(Document.id), func.coalesce(func.sum(Document.size_bytes), 0))
+        .filter(Document.owner_id == user_id)
+        .one()
+    )
+    return int(count), int(total)
+
+
+def check_quota(db: Session, user_id: int, new_bytes: int):
+    count, total = storage_usage(db, user_id)
+
+    if count >= MAX_DOCUMENTS_PER_USER:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You can store up to {MAX_DOCUMENTS_PER_USER} documents. Delete some to upload more.",
+        )
+
+    if total + new_bytes > MAX_STORAGE_PER_USER:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This upload would exceed your {MAX_STORAGE_PER_USER // (1024 * 1024)} MB storage limit. "
+                "Delete some documents to free space."
+            ),
+        )
+
+
+def usage_summary(db: Session, user_id: int) -> dict:
+    count, total = storage_usage(db, user_id)
+    return {
+        "documents": count,
+        "max_documents": MAX_DOCUMENTS_PER_USER,
+        "bytes": total,
+        "max_bytes": MAX_STORAGE_PER_USER,
+    }
+
+
 def process_upload(db: Session, user: User, upload: UploadFile) -> dict:
     filename = safe_filename(upload.filename)
 
@@ -269,6 +322,18 @@ def process_upload(db: Session, user: User, upload: UploadFile) -> dict:
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
+    content_hash = hashlib.sha256(content).hexdigest()
+    is_known = (
+        db.query(Document.id)
+        .filter(Document.owner_id == user.id, Document.sha256 == content_hash)
+        .first()
+        is not None
+    )
+
+    # Cheap early check so over-quota files are never parsed or embedded.
+    if not is_known:
+        check_quota(db, user.id, len(content))
+
     pages = extract_pages(content)
     characters = sum(len(page) for page in pages)
 
@@ -281,7 +346,6 @@ def process_upload(db: Session, user: User, upload: UploadFile) -> dict:
             ),
         )
 
-    content_hash = hashlib.sha256(content).hexdigest()
     document = (
         db.query(Document)
         .filter(Document.owner_id == user.id, Document.sha256 == content_hash)
@@ -293,31 +357,38 @@ def process_upload(db: Session, user: User, upload: UploadFile) -> dict:
         return {"document": serialize_document(document), "duplicate": True}
 
     if document is None:
-        if db.query(Document).filter(Document.owner_id == user.id).count() >= MAX_DOCUMENTS_PER_USER:
-            raise HTTPException(
-                status_code=400,
-                detail=f"You can store up to {MAX_DOCUMENTS_PER_USER} documents. Delete some to upload more.",
-            )
+        with _user_locks[user.id]:
+            # Authoritative check and insert in one transaction. FOR UPDATE on
+            # the user row blocks concurrent uploads by the same user on
+            # PostgreSQL (SQLite ignores it; the process lock covers it there).
+            db.query(User).filter(User.id == user.id).with_for_update().one()
+            check_quota(db, user.id, len(content))
 
-        document = Document(
-            id=uuid.uuid4().hex,
-            owner_id=user.id,
-            filename=filename,
-            content_type="application/pdf",
-            size_bytes=len(content),
-            sha256=content_hash,
-            pages=len(pages),
-            characters=characters,
-            status="processing",
-        )
-        document.file = DocumentFile(data=content)
-        db.add(document)
+            document = Document(
+                id=uuid.uuid4().hex,
+                owner_id=user.id,
+                filename=filename,
+                content_type="application/pdf",
+                size_bytes=len(content),
+                sha256=content_hash,
+                pages=len(pages),
+                characters=characters,
+                status="processing",
+            )
+            document.file = DocumentFile(data=content)
+            db.add(document)
+
+            try:
+                # Store the PDF and its metadata before the slower embedding step.
+                db.commit()
+            except IntegrityError:
+                # The same file was stored by a concurrent request.
+                db.rollback()
+                raise HTTPException(status_code=409, detail="This file is already being uploaded.")
     else:
         document.status = "processing"
         document.error = None
-
-    # Store the PDF and its metadata before the slower embedding step.
-    db.commit()
+        db.commit()
 
     index_document(db, document, pages)
     return {"document": serialize_document(document), "duplicate": False}
@@ -363,9 +434,21 @@ def health_check():
     }
 
 
+@app.get("/debug/forwarded")
+def debug_forwarded(request: Request):
+    # TEMPORARY: shows the proxy chain so TRUSTED_PROXY_HOPS can be set from
+    # evidence. Returns only addresses already present in the caller's own request.
+    return {
+        "x_forwarded_for": request.headers.get("x-forwarded-for"),
+        "peer": request.client.host if request.client else None,
+        "client_ip": client_ip(request),
+    }
+
+
 @app.post("/auth/register", status_code=201)
 def register(credentials: Credentials, request: Request, db: Session = Depends(get_db)):
     limiter.check(f"auth:ip:{client_ip(request)}", *AUTH_LIMIT)
+    limiter.check("auth:register:all", *REGISTER_GLOBAL_LIMIT)
 
     if not ALLOW_REGISTRATION:
         raise HTTPException(status_code=403, detail="Registration is currently disabled.")
@@ -421,7 +504,10 @@ def list_documents(user: User = Depends(get_current_user), db: Session = Depends
         .order_by(Document.created_at.desc())
         .all()
     )
-    return {"documents": [serialize_document(document) for document in documents]}
+    return {
+        "documents": [serialize_document(document) for document in documents],
+        "usage": usage_summary(db, user.id),
+    }
 
 
 @app.post("/documents", status_code=201)

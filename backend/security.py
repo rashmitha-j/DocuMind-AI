@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import os
 import secrets
 import threading
@@ -15,7 +16,8 @@ from sqlalchemy.orm import Session
 from database import AuthSession, User, get_db, utcnow
 
 SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
-TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "true").lower() == "true"
+# Number of proxies in front of the app that append to X-Forwarded-For.
+TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
 
 _hasher = PasswordHasher()
 _bearer = HTTPBearer(auto_error=False)
@@ -94,11 +96,30 @@ def get_current_user(session: AuthSession = Depends(get_current_session)) -> Use
 
 
 def client_ip(request: Request) -> str:
-    if TRUST_PROXY_HEADERS:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Return the client address as seen by the last trusted proxy.
+
+    Proxies append the address they received the request from to
+    X-Forwarded-For, so everything to the left of the trusted hops can be
+    forged by the client. With TRUSTED_PROXY_HOPS=N the Nth entry from the
+    right is used; 0 ignores the header and uses the socket peer.
+    """
+
+    peer = request.client.host if request.client else "unknown"
+
+    if TRUSTED_PROXY_HOPS <= 0:
+        return peer
+
+    entries = [part.strip() for part in request.headers.get("x-forwarded-for", "").split(",")]
+    entries = [entry for entry in entries if entry]
+
+    if len(entries) < TRUSTED_PROXY_HOPS:
+        return peer
+
+    candidate = entries[-TRUSTED_PROXY_HOPS]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return peer
 
 
 class RateLimiter:

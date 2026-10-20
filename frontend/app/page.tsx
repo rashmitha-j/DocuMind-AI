@@ -9,6 +9,7 @@ import {
   type DocumentInfo,
   type Source,
   type UploadResult,
+  type Usage,
   type User,
 } from "@/lib/api";
 
@@ -270,6 +271,7 @@ function Workspace({
   onSessionExpired: () => void;
 }) {
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
+  const [usage, setUsage] = useState<Usage | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [loadingLibrary, setLoadingLibrary] = useState(true);
   const [libraryError, setLibraryError] = useState("");
@@ -294,9 +296,10 @@ function Workspace({
 
   const loadDocuments = useCallback(
     () =>
-      api<{ documents: DocumentInfo[] }>("/documents", { token })
+      api<{ documents: DocumentInfo[]; usage: Usage }>("/documents", { token })
         .then((result) => {
           setDocuments(result.documents);
+          setUsage(result.usage);
           setLibraryError("");
           // Drop selections for documents that no longer exist or are not ready.
           setSelected((previous) =>
@@ -488,6 +491,13 @@ function Workspace({
             }}
           />
         </label>
+
+        {usage && (
+          <p className="mt-2 text-center text-[11px] text-slate-400">
+            {usage.documents}/{usage.max_documents} documents · {formatSize(usage.bytes)} of{" "}
+            {formatSize(usage.max_bytes)} used
+          </p>
+        )}
 
         <div className="mt-6 flex items-center justify-between">
           <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">

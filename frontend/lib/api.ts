@@ -28,6 +28,13 @@ export type Source = {
   excerpt: string;
 };
 
+export type Usage = {
+  documents: number;
+  max_documents: number;
+  bytes: number;
+  max_bytes: number;
+};
+
 export type UploadResult = {
   filename: string;
   ok: boolean;
@@ -108,6 +115,7 @@ export async function api<T = unknown>(path: string, options: RequestOptions = {
 }
 
 export function formatSize(bytes: number) {
+  if (bytes === 0) return "0 KB";
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
