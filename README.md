@@ -1,6 +1,6 @@
 # DocuMind AI
 
-[![CI](https://github.com/rashmitha-j/DocuMind-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/rashmitha-j/DocuMind-AI/actions/workflows/ci.yml)
+[![CI](https://github.com/rashmitha-j/DocuMind-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/rashmitha-j/DocuMind-AI/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Author:** Rashmitha J
 
@@ -53,6 +53,7 @@ There is no answer-with-citations screenshot yet. While capturing on 2026-10-20,
 - [Security guidance](#security-guidance)
 - [Known limitations](#known-limitations)
 - [Project status](#project-status)
+- [License](#license)
 
 ## Problem and objectives
 
@@ -457,3 +458,7 @@ Verified on 2026-10-20:
 - **Local end-to-end with real Gemini:** sign-in, upload and indexing of two synthetic PDFs succeeded (screenshots above). Indexing took about 3 minutes because Gemini was under heavy load. The follow-up question then hit the embedding deadline and returned a clear "timed out, try again" message instead of hanging.
 - **Gemini reliability:** on 2026-10-20 `gemini-3.8-flash` repeatedly returned `503 UNAVAILABLE` (high demand), and embeddings were slow. The fallback model and deadlines handle this, but answers can fail or take a while during such periods.
 - **Not verified live:** cross-user isolation on the production deployment. It is covered by offline tests only, because creating extra accounts on production was avoided.
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright (c) 2026 Rashmitha J.
